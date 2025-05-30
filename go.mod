@@ -1,4 +1,4 @@
-module github.com/theo/cursorcache
+module github.com/zihoulaai/cursorcache
 
 go 1.24.2
 

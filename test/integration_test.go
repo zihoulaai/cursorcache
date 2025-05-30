@@ -18,8 +18,8 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	"github.com/theo/cursorcache"
-	"github.com/theo/cursorcache/redisbloom"
+	"github.com/zihoulaai/cursorcache"
+	"github.com/zihoulaai/cursorcache/redisbloom"
 )
 
 type Item struct {
