@@ -78,9 +78,9 @@ func (s *TestSuite) setupMySQL() {
 		ExposedPorts: []string{"3306/tcp"},
 		Env: map[string]string{
 			"MYSQL_ROOT_PASSWORD": "root",
-			"MYSQL_DATABASE":      "testdb",
-			"MYSQL_USER":          "testuser",
-			"MYSQL_PASSWORD":      "testpass",
+			"MYSQL_DATABASE":      "test_db",
+			"MYSQL_USER":          "test_user",
+			"MYSQL_PASSWORD":      "test_pass",
 		},
 		WaitingFor: wait.ForAll(
 			wait.ForLog("ready for connections"),
@@ -96,7 +96,7 @@ func (s *TestSuite) setupMySQL() {
 	endpoint, err := container.Endpoint(s.ctx, "")
 	require.NoError(s.T(), err)
 
-	dsn := fmt.Sprintf("testuser:testpass@tcp(%s)/testdb?charset=utf8mb4&parseTime=True&loc=Local", endpoint)
+	dsn := fmt.Sprintf("test_user:test_pass@tcp(%s)/test_db?charset=utf8mb4&parseTime=True&loc=Local", endpoint)
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	require.NoError(s.T(), err, "failed to connect to MySQL")
 
