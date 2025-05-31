@@ -2,8 +2,10 @@ package test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/go-redis/cache/v9"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -318,40 +320,49 @@ func (s *TestSuite) TestCacheFunctionality() {
 	t := s.T()
 	fetcher := mockDB(s.db)
 
+	page := cursorcache.NewCursorCache[Item](cache.New(&cache.Options{
+		Redis: s.rdb,
+		//LocalCache: cache.NewTinyLFU(100, 0.1),
+		Marshal:      json.Marshal,
+		Unmarshal:    json.Unmarshal,
+		StatsEnabled: false,
+	}),
+		cursorcache.WithBloomFilter[Item](s.bloom),
+		cursorcache.WithTTL[Item](10*time.Second),
+		cursorcache.WithRandomRange[Item](1),
+	)
+
 	req := cursorcache.PageRequest[Item]{
-		Cursor:      "",
-		Direction:   cursorcache.NextPage,
-		PageSize:    5,
-		KeyPrefix:   "test_page",
-		Fetcher:     fetcher,
-		TTL:         5 * time.Second,
-		RandomRange: 1,
-		Bloom:       s.bloom,
+		Cursor:    "",
+		Direction: cursorcache.NextPage,
+		PageSize:  5,
+		KeyPrefix: "test_page",
+		Fetcher:   fetcher,
 	}
 
 	// 第一次请求 - 应缓存未命中
-	resp, err := cursorcache.PaginateWithCache(s.ctx, s.rdb, req)
+	resp, err := page.Paginate(s.ctx, req)
 	require.NoError(t, err)
 	require.Len(t, resp.Data, 5)
 	require.False(t, resp.FromCache, "first request should not be from cache")
 	require.NotEmpty(t, resp.NextCursor, "next cursor should exist")
 
 	// 第二次相同请求 - 应缓存命中
-	resp2, err := cursorcache.PaginateWithCache(s.ctx, s.rdb, req)
+	resp2, err := page.Paginate(s.ctx, req)
 	require.NoError(t, err)
 	require.Len(t, resp2.Data, 5)
 	require.True(t, resp2.FromCache, "second request should be from cache")
 
 	// 测试缓存过期
-	time.Sleep(7 * time.Second)
-	resp3, err := cursorcache.PaginateWithCache(s.ctx, s.rdb, req)
+	time.Sleep(10 * time.Second)
+	resp3, err := page.Paginate(s.ctx, req)
 	require.NoError(t, err)
 	require.Len(t, resp3.Data, 5)
 	require.False(t, resp3.FromCache, "request after TTL should not be from cache")
 
 	// 测试不同游标的缓存
 	req.Cursor = resp.NextCursor
-	resp4, err := cursorcache.PaginateWithCache(s.ctx, s.rdb, req)
+	resp4, err := page.Paginate(s.ctx, req)
 	require.NoError(t, err)
 	require.Len(t, resp4.Data, 5)
 	require.False(t, resp4.FromCache, "new cursor request should not be from cache")
@@ -362,15 +373,24 @@ func (s *TestSuite) TestConcurrentRequests() {
 	t := s.T()
 	fetcher := mockDB(s.db)
 
+	page := cursorcache.NewCursorCache[Item](cache.New(&cache.Options{
+		Redis: s.rdb,
+		//LocalCache: cache.NewTinyLFU(100, 0.1),
+		Marshal:      json.Marshal,
+		Unmarshal:    json.Unmarshal,
+		StatsEnabled: false,
+	}),
+		cursorcache.WithBloomFilter[Item](s.bloom),
+		cursorcache.WithTTL[Item](10*time.Second),
+		cursorcache.WithRandomRange[Item](1),
+	)
+
 	req := cursorcache.PageRequest[Item]{
-		Cursor:      "",
-		Direction:   cursorcache.NextPage,
-		PageSize:    5,
-		KeyPrefix:   "concurrent_page",
-		Fetcher:     fetcher,
-		TTL:         10 * time.Second,
-		RandomRange: 1,
-		Bloom:       s.bloom,
+		Cursor:    "",
+		Direction: cursorcache.NextPage,
+		PageSize:  5,
+		KeyPrefix: "concurrent_page",
+		Fetcher:   fetcher,
 	}
 
 	const numRequests = 20
@@ -386,7 +406,7 @@ func (s *TestSuite) TestConcurrentRequests() {
 	for i := 0; i < numRequests; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			resp, err := cursorcache.PaginateWithCache(s.ctx, s.rdb, req)
+			resp, err := page.Paginate(s.ctx, req)
 			if err != nil {
 				errCh <- err
 				return

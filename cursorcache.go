@@ -2,154 +2,231 @@ package cursorcache
 
 import (
 	"context"
-	"errors"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"math/rand"
 	"time"
 
-	"golang.org/x/exp/rand"
+	"github.com/go-redis/cache/v9"
 	"golang.org/x/exp/slices"
-
-	"github.com/bsm/redislock"
-	"github.com/redis/go-redis/v9"
 )
 
-// PaginateWithCache 实现带缓存的游标分页查询。
-// 1. 通过布隆过滤器快速判断是否需要返回空数据。
-// 2. 查询缓存，若命中直接返回。
-// 3. 获取分布式锁防止缓存击穿。
-// 4. 再次检查缓存，防止并发穿透。
-// 5. 拉取数据，处理游标方向。
-// 6. 写入缓存，设置过期时间。
-// 7. 更新布隆过滤器。
-// ctx: 上下文。
-// rdb: Redis 客户端。
-// req: 分页请求参数。
-// 返回分页响应和错误信息。
-func PaginateWithCache[T any](ctx context.Context, rdb redis.UniversalClient, req PageRequest[T]) (*PageResponse[T], error) {
-	cacheKey := getCacheKey(req.KeyPrefix, req.Cursor, req.Direction)
+func init() {
+	rand.New(rand.NewSource(time.Now().UnixNano()))
+}
 
-	// 1. 布隆过滤器快速判断
-	if shouldReturnEmptyByBloom(ctx, req) {
+// 常量
+const (
+	DefaultTTL         = 10 * time.Second // 默认缓存时间
+	DefaultRandomRange = 10               // 随机抖动范围
+	DefaultMinEmptyTTL = 30 * time.Second
+)
+
+// CursorDirection 游标方向
+type CursorDirection string
+
+const (
+	NextPage CursorDirection = "next"
+	PrevPage CursorDirection = "prev"
+)
+
+// FetcherFunc 定义
+type FetcherFunc[T any] func(ctx context.Context, cursor string, size int, dir CursorDirection) ([]T, string, string, error)
+
+// TTLFunc 定义：注意这里改为 cache.Fetch 接受的签名
+type TTLFunc func(ctx context.Context, data interface{}) time.Duration
+
+// BloomFilter 接口（以 bits-and-blooms/bloom/v3 为例）
+type BloomFilter interface {
+	Exists(ctx context.Context, key string) (bool, error)
+	Add(ctx context.Context, key string) error
+}
+
+// ComplexCursor 复合游标
+type ComplexCursor struct {
+	CreatedAt time.Time `json:"created_at"`
+	ID        int64     `json:"id"`
+}
+
+type CacheConfig struct {
+	//RedisClient redis.UniversalClient
+	BloomFilter BloomFilter
+	DefaultTTL  time.Duration
+	RandomRange int
+	CacheStore  *cache.Cache
+}
+
+type PageRequest[T any] struct {
+	Cursor    string
+	Direction CursorDirection
+	PageSize  int
+	KeyPrefix string
+	Fetcher   FetcherFunc[T]
+}
+
+type PageResponse[T any] struct {
+	Data       []T
+	NextCursor string
+	PrevCursor string
+	FromCache  bool
+}
+
+type CursorCache[T any] struct {
+	//rdb         redis.UniversalClient
+	bloom       BloomFilter
+	defaultTTL  time.Duration
+	randomRange int
+	cacheStore  *cache.Cache
+}
+
+type Option[T any] func(*CursorCache[T])
+
+func WithBloomFilter[T any](bf BloomFilter) Option[T] {
+	return func(c *CursorCache[T]) {
+		c.bloom = bf
+	}
+}
+
+func WithTTL[T any](ttl time.Duration) Option[T] {
+	return func(c *CursorCache[T]) {
+		c.defaultTTL = ttl
+	}
+}
+
+func WithRandomRange[T any](sec int) Option[T] {
+	return func(c *CursorCache[T]) {
+		c.randomRange = sec
+	}
+}
+
+func NewCursorCache[T any](store *cache.Cache, opts ...Option[T]) *CursorCache[T] {
+	if store == nil {
+		panic("cacheStore is required")
+	}
+
+	cc := &CursorCache[T]{
+		cacheStore:  store,
+		defaultTTL:  DefaultTTL,
+		randomRange: DefaultRandomRange,
+	}
+
+	for _, opt := range opts {
+		opt(cc)
+	}
+
+	return cc
+}
+
+func (c *CursorCache[T]) Paginate(ctx context.Context, req PageRequest[T]) (*PageResponse[T], error) {
+	cacheKey := c.getCacheKey(req.KeyPrefix, req.Cursor, req.Direction)
+
+	// 布隆检查
+	if c.shouldReturnEmpty(ctx, req.Cursor) {
 		return &PageResponse[T]{Data: []T{}}, nil
 	}
 
-	// 2. 查询缓存
-	if cached, ok := tryGetCache[T](ctx, rdb, cacheKey); ok {
-		// 如果缓存存在，直接返回
-		cached.FromCache = true
-		return cached, nil
-	}
-
-	// 3. 分布式锁防击穿
-	lock, err := obtainLock(ctx, rdb, cacheKey)
-	if err != nil {
-		if errors.Is(err, redislock.ErrNotObtained) {
-			time.Sleep(50 * time.Millisecond)
-			return PaginateWithCache[T](ctx, rdb, req)
-		}
-		return nil, err
-	}
-	defer lock.Release(ctx)
-
-	// 4. 二次检查缓存
-	if cached, ok := tryGetCache[T](ctx, rdb, cacheKey); ok {
-		// 如果缓存存在，直接返回
-		cached.FromCache = true
-		return cached, nil
-	}
-
-	// 5. 拉取数据
-	data, next, prev, err := req.Fetcher(ctx, req.Cursor, req.PageSize, req.Direction)
-	if err != nil {
-		return nil, err
-	}
-	if req.Direction == PrevPage {
-		slices.Reverse(data)
-	}
-
-	resp := &PageResponse[T]{
-		Data:       data,
-		NextCursor: next,
-		PrevCursor: prev,
-		FromCache:  false,
-	}
-
-	// 6. 缓存写入
-	ttl := calcTTL(req.TTL, len(data), req.RandomRange)
-	setCache(ctx, rdb, cacheKey, resp, ttl)
-
-	// 7. 更新布隆过滤器
-	updateBloom(ctx, req, data, next, prev)
-
-	return resp, nil
-}
-
-// --- 辅助函数 ---
-
-// shouldReturnEmptyByBloom 判断布隆过滤器是否可以直接返回空数据。
-// ctx: 上下文。
-// req: 分页请求参数。
-// 返回 true 表示可直接返回空数据。
-func shouldReturnEmptyByBloom[T any](ctx context.Context, req PageRequest[T]) bool {
-	if req.Bloom != nil && req.Cursor != "" {
-		exists, err := req.Bloom.Exists(ctx, req.Cursor)
-		return err == nil && !exists
-	}
-	return false
-}
-
-// tryGetCache 尝试从缓存获取分页数据。
-// ctx: 上下文。
-// rdb: Redis 客户端。
-// key: 缓存键。
-// 返回缓存数据和是否命中缓存。
-func tryGetCache[T any](ctx context.Context, rdb redis.UniversalClient, key string) (*PageResponse[T], bool) {
-	var cached PageResponse[T]
-	if err := getCachedPage(ctx, rdb, key, &cached); err == nil {
-		cached.FromCache = true
-		return &cached, true
-	}
-	return nil, false
-}
-
-// obtainLock 获取分布式锁，防止缓存击穿。
-// ctx: 上下文。
-// rdb: Redis 客户端。
-// cacheKey: 缓存键。
-// 返回锁对象和错误信息。
-func obtainLock(ctx context.Context, rdb redis.UniversalClient, cacheKey string) (*redislock.Lock, error) {
-	locker := redislock.New(rdb)
-	return locker.Obtain(ctx, "lock:"+cacheKey, 3*time.Second, &redislock.Options{
-		RetryStrategy: redislock.ExponentialBackoff(50*time.Millisecond, 5),
+	var resp PageResponse[T]
+	// 使用 cache.Get，内部会自动做锁、防击穿、single flight 等
+	var fromCache = true
+	ttl := c.makeTTL(ctx, nil)
+	err := c.cacheStore.Once(&cache.Item{
+		Key:   cacheKey,
+		Value: &resp,
+		TTL:   ttl,
+		Do: func(*cache.Item) (any, error) {
+			fromCache = false
+			data, next, prev, err := req.Fetcher(ctx, req.Cursor, req.PageSize, req.Direction)
+			if err != nil {
+				return nil, err
+			}
+			if req.Direction == PrevPage {
+				slices.Reverse(data)
+			}
+			out := &PageResponse[T]{
+				Data:       data,
+				NextCursor: next,
+				PrevCursor: prev,
+				FromCache:  false,
+			}
+			go c.updateBloom(ctx, req.Cursor, next, prev)
+			return out, nil
+		},
 	})
+
+	if err != nil {
+		return nil, err
+	}
+	resp.FromCache = fromCache
+	return &resp, nil
 }
 
-// calcTTL 计算缓存的过期时间，支持抖动。
-// baseTTL: 基础过期时间。
-// dataLen: 数据长度。
-// randomRange: 抖动范围（秒）。
-// 返回最终过期时间。
-func calcTTL(baseTTL time.Duration, dataLen, randomRange int) time.Duration {
+// 生成缓存键
+func (c *CursorCache[T]) getCacheKey(prefix, cursor string, dir CursorDirection) string {
+	return fmt.Sprintf("%s:%s:%s", prefix, cursor, string(dir))
+}
+
+// 布隆判断
+func (c *CursorCache[T]) shouldReturnEmpty(ctx context.Context, cursor string) bool {
+	if c.bloom == nil || cursor == "" {
+		return false
+	}
+	exists, err := c.bloom.Exists(ctx, cursor)
+	return err == nil && !exists
+}
+
+// 更新布隆
+func (c *CursorCache[T]) updateBloom(ctx context.Context, cursors ...string) {
+	if c.bloom == nil {
+		return
+	}
+	for _, cur := range cursors {
+		if cur != "" {
+			_ = c.bloom.Add(ctx, cur)
+		}
+	}
+}
+
+// 自定义 TTL 计算（cache.Fetch 形式签名）
+func (c *CursorCache[T]) makeTTL(ctx context.Context, data interface{}) time.Duration {
+	// data 类型是 *PageResponse[T]，但这里只根据 Data 长度做随机抖动
+	resp, _ := data.(*PageResponse[T])
+	dataLen := 0
+	if resp != nil {
+		dataLen = len(resp.Data)
+	}
 	if dataLen == 0 {
-		return min(baseTTL, 30*time.Second)
+		// 空结果至少留一定最小时间
+		if c.defaultTTL < DefaultMinEmptyTTL {
+			return c.defaultTTL
+		}
+		return DefaultMinEmptyTTL
 	}
-	jitter := time.Duration(rand.Intn(randomRange)) * time.Second
-	return baseTTL + jitter
+	// 随机抖动
+	jitter := time.Duration(rand.Intn(c.randomRange)) * time.Second
+	return c.defaultTTL + jitter
 }
 
-// updateBloom 更新布隆过滤器，添加当前游标及前后游标。
-// ctx: 上下文。
-// req: 分页请求参数。
-// data: 当前页数据。
-// next: 下一页游标。
-// prev: 上一页游标。
-func updateBloom[T any](ctx context.Context, req PageRequest[T], data []T, next, prev string) {
-	if req.Bloom != nil && len(data) > 0 {
-		req.Bloom.Add(ctx, req.Cursor)
-		if prev != "" {
-			req.Bloom.Add(ctx, prev)
-		}
-		if next != "" {
-			req.Bloom.Add(ctx, next)
-		}
+// EncodeCursor / DecodeCursor
+func EncodeCursor(c *ComplexCursor) string {
+	if c == nil {
+		return ""
 	}
+	b, _ := json.Marshal(c)
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+func DecodeCursor(s string) (*ComplexCursor, error) {
+	if s == "" {
+		return nil, nil
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+	var c ComplexCursor
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, err
+	}
+	return &c, nil
 }

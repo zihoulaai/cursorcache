@@ -33,8 +33,8 @@ func (rb *RedisBloom) Init(ctx context.Context, capacity int64, errorRate float6
 // Add 向 Bloom 过滤器添加一个元素
 // ctx: 上下文
 // key: 要添加的元素
-func (rb *RedisBloom) Add(ctx context.Context, key string) {
-	rb.Client.Do(ctx, "BF.ADD", rb.Key, key)
+func (rb *RedisBloom) Add(ctx context.Context, key string) error {
+	return rb.Client.Do(ctx, "BF.ADD", rb.Key, key).Err()
 }
 
 // Exists 检查元素是否存在于 Bloom 过滤器中
